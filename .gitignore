@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+*.egg-info/
+.installed.cfg
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# Environment / secret files
+.env
+.env.*
+
+# Editor and IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+
+# Logs
+logs/
+*.log
+
+# Data and model artifacts
+data/
+models/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
