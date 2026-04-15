@@ -1,129 +1,248 @@
-import logging
+from __future__ import annotations
+
+import io
 from pathlib import Path
 from typing import Optional
 
-import joblib
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-import seaborn as sns
 import streamlit as st
-from sklearn.metrics import ConfusionMatrixDisplay, RocCurveDisplay, precision_score, recall_score
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+from evaluation import compute_metrics, plot_confusion_matrix, plot_roc, threshold_impact
+from model import (
+    ModelPayload,
+    available_model_paths,
+    expected_raw_feature_columns,
+    load_model_payload,
+    predict_fraud_probability,
+    try_random_forest_feature_importance,
+)
+from preprocessing import validate_and_prepare
 
-st.set_page_config(page_title="Fraud Detection", layout="wide")
-
-
-@st.cache_resource
-def load_model(model_path: str = "models/best_model.joblib"):
-    path = Path(model_path)
-    if not path.exists():
-        raise FileNotFoundError("Trained model not found. Please run training first.")
-    payload = joblib.load(path)
-    model = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-    metrics = payload.get("metrics") if isinstance(payload, dict) else {}
-    best_name = payload.get("best_model") if isinstance(payload, dict) else "model"
-    return model, metrics, best_name
+st.set_page_config(page_title="Fraud Detection Dashboard", layout="wide")
 
 
-def predict(model, df: pd.DataFrame) -> pd.Series:
-    if hasattr(model, "predict_proba"):
-        probs = model.predict_proba(df)[:, 1]
-    else:
-        scores = model.decision_function(df)
-        probs = (scores.max() - scores) / (scores.max() - scores.min() + 1e-8)
-    return pd.Series(probs, index=df.index, name="fraud_probability")
+@st.cache_data
+def _read_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(file_bytes))
 
 
-def plot_confusion_matrix(y_true: pd.Series, y_pred: pd.Series) -> None:
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ConfusionMatrixDisplay.from_predictions(y_true, y_pred, cmap="Blues", ax=ax)
-    plt.title("Confusion Matrix")
-    plt.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+def _metric_help() -> str:
+    return (
+        "Precision: among flagged as fraud, how many are truly fraud.\n\n"
+        "Recall: among true fraud, how many we catch.\n\n"
+        "F1: balance of precision and recall.\n\n"
+        "ROC-AUC: ranking quality across thresholds (1.0 is best)."
+    )
 
 
-def plot_roc(y_true: pd.Series, y_proba: pd.Series) -> None:
-    fig, ax = plt.subplots(figsize=(10, 8))
-    RocCurveDisplay.from_predictions(y_true, y_proba, ax=ax)
-    plt.title("ROC Curve")
-    plt.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+def _render_header() -> None:
+    st.title("🛡️ Fraud Detection Dashboard")
+    st.caption(
+        "Upload transactions, score fraud risk, and (optionally) evaluate performance when ground-truth `is_fraud` is present. "
+        "Designed for clean academic demonstration: clear flow, robust validation, and explainable outputs."
+    )
+    st.divider()
 
 
-def highlight_risk(df: pd.DataFrame, prob_col: str = "fraud_probability", threshold: float = 0.5):
-    def color_row(row):
-        color = "#ffb3b3" if row[prob_col] >= threshold else ""
-        return [f"background-color: {color}"] * len(row)
+def _render_sidebar(model_paths: dict[str, "Path"]) -> dict:
+    st.sidebar.header("⚙️ Controls")
 
-    return df.style.apply(color_row, axis=1)
+    upload = st.sidebar.file_uploader("📤 Upload transactions CSV", type=["csv"])
+
+    model_key = st.sidebar.selectbox(
+        "🧠 Model selection",
+        options=(["best_model"] + [k for k in ["log_reg", "random_forest", "isolation_forest"] if k in model_paths]),
+        format_func=lambda k: {
+            "best_model": "Best saved model (recommended)",
+            "log_reg": "Logistic Regression",
+            "random_forest": "Random Forest",
+            "isolation_forest": "Isolation Forest (anomaly)",
+        }.get(k, k),
+    )
+
+    threshold = st.sidebar.slider("🎚️ Fraud threshold", 0.05, 0.95, 0.50, 0.01)
+    top_n = st.sidebar.slider("🔎 Show top risky transactions", 5, 50, 10, 5)
+
+    st.sidebar.divider()
+    show_explain = st.sidebar.checkbox("📚 Show faculty explanation", value=True)
+    show_threshold_impact = st.sidebar.checkbox("📈 Show threshold impact", value=True)
+    allow_download = st.sidebar.checkbox("⬇️ Enable results download", value=True)
+
+    return {
+        "upload": upload,
+        "model_key": model_key,
+        "threshold": float(threshold),
+        "top_n": int(top_n),
+        "show_explain": bool(show_explain),
+        "show_threshold_impact": bool(show_threshold_impact),
+        "allow_download": bool(allow_download),
+    }
+
+
+def _render_model_comparison(payload: ModelPayload) -> None:
+    st.subheader("📊 Model comparison (from training run)")
+    if not payload.metrics:
+        st.info("No training metrics were packaged with the saved model artifact.")
+        return
+    df = (
+        pd.DataFrame(payload.metrics)
+        .T.rename_axis("model")
+        .reset_index()
+        .sort_values(["roc_auc", "f1"], ascending=False, na_position="last")
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def _render_explainability(payload: ModelPayload, *, threshold: float) -> None:
+    st.subheader("📚 Explainability (for viva / demo)")
+
+    st.markdown(
+        f"""
+**Which model is used?** `{payload.model_name}` (loaded from `{payload.source_path.as_posix()}`)
+
+**Why this model?**
+- During training, we compare multiple algorithms and select the best-performing one using validation metrics (ROC-AUC and F1).
+- The saved artifact contains the chosen pipeline including preprocessing, so inference uses the same transformations as training.
+
+**How to interpret the score?**
+- Each transaction gets a fraud risk score in \\([0, 1]\\).
+- A transaction is *flagged* as fraud when `fraud_probability ≥ {threshold:.2f}`.
+        """.strip()
+    )
+
+    imp = try_random_forest_feature_importance(payload.model)
+    if imp is not None and not imp.empty:
+        with st.expander("🌲 Optional: Random Forest feature importance", expanded=False):
+            st.caption("Higher importance means the feature contributed more to the model’s splits (after preprocessing).")
+            st.dataframe(imp.head(20), use_container_width=True, hide_index=True)
 
 
 def main() -> None:
-    st.write("Upload transaction data to score fraud risk. If `is_fraud` is present, evaluation plots will be shown.")
+    _render_header()
 
+    model_paths = available_model_paths("models")
+    controls = _render_sidebar(model_paths)
+
+    # Load selected model artifact.
     try:
-        model, metrics, best_name = load_model()
-        st.success(f"Loaded model: {best_name}")
-        if metrics:
-            st.json(metrics)
-    except FileNotFoundError as e:
+        if controls["model_key"] == "best_model":
+            payload = load_model_payload("models/best_model.joblib")
+        else:
+            # Optional artifacts if you export them.
+            payload = load_model_payload(str(model_paths[controls["model_key"]]))
+    except Exception as e:
         st.error(str(e))
+        st.info("If you haven't trained yet, run `python -m src.model --data_path data/transactions.csv --model_dir models`.")
         return
 
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    threshold = st.slider("Fraud threshold", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
+    left, right = st.columns([2, 1], vertical_alignment="top")
+    with left:
+        st.success(f"✅ Model loaded: **{payload.model_name}**")
+    with right:
+        st.caption("🧾 Tip: include `is_fraud` in your CSV to enable evaluation plots & metrics.")
 
-    if uploaded:
-        df = pd.read_csv(uploaded)
-        if df.empty:
-            st.warning("Uploaded file is empty.")
-            return
+    st.divider()
 
-        target_present = "is_fraud" in df.columns
-        if target_present:
-            y_true = df["is_fraud"]
-            X = df.drop(columns=["is_fraud"])
-        else:
-            y_true = None
-            X = df
+    if payload.metrics:
+        _render_model_comparison(payload)
+        st.divider()
 
-        probs = predict(model, X)
-        preds = (probs >= threshold).astype(int)
+    uploaded = controls["upload"]
+    if uploaded is None:
+        st.info("📤 Upload a CSV from the sidebar to begin.")
+        return
 
-        results = df.copy()
-        results["fraud_probability"] = probs
-        results["fraud_prediction"] = preds
+    try:
+        df = _read_csv_bytes(uploaded.getvalue())
+    except Exception:
+        st.error("Could not read the uploaded file as a CSV. Please upload a valid `.csv`.")
+        return
 
-        st.subheader("Fraud Probabilities")
-        st.dataframe(highlight_risk(results.sort_values(by="fraud_probability", ascending=False), threshold=threshold))
+    expected_cols = expected_raw_feature_columns(payload.model)
 
-        st.subheader("Top High-Risk Transactions")
-        st.dataframe(results.nlargest(10, "fraud_probability")[["fraud_probability"] + [c for c in df.columns if c != "fraud_probability"]])
+    try:
+        X, y_true, report = validate_and_prepare(df, expected_columns=expected_cols, target_col="is_fraud")
+    except Exception as e:
+        st.error(str(e))
+        if expected_cols:
+            with st.expander("Expected feature schema", expanded=False):
+                st.write(pd.DataFrame({"expected_columns": expected_cols}))
+        return
 
-        if target_present:
-            st.subheader("Confusion Matrix")
-            plot_confusion_matrix(y_true, preds)
+    if report.dropped_extra:
+        st.warning(
+            "Dropped extra columns not used by the trained pipeline: " + ", ".join(report.dropped_extra[:25])
+            + (" ..." if len(report.dropped_extra) > 25 else "")
+        )
 
-            st.subheader("ROC Curve")
-            plot_roc(y_true, probs)
+    # Predict
+    try:
+        proba = predict_fraud_probability(payload.model, X)
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        return
 
-            st.subheader("Metrics on Uploaded Data")
-            st.write(
-                {
-                    "precision": float(precision_score(y_true, preds)),
-                    "recall": float(recall_score(y_true, preds)),
-                }
-            )
-        else:
-            st.info("No `is_fraud` column provided. Showing scores only.")
+    threshold = controls["threshold"]
+    pred = (proba >= threshold).astype(int).rename("fraud_prediction")
 
+    results = df.copy()
+    results["fraud_probability"] = proba
+    results["fraud_prediction"] = pred
+
+    st.subheader("📌 Key metrics")
+    if y_true is not None:
+        m = compute_metrics(y_true, proba, threshold=threshold)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🎯 Precision", f"{m.precision:.3f}", help=_metric_help())
+        c2.metric("🧲 Recall", f"{m.recall:.3f}", help=_metric_help())
+        c3.metric("⚖️ F1-score", f"{m.f1:.3f}", help=_metric_help())
+        c4.metric("📈 ROC-AUC", "N/A" if pd.isna(m.roc_auc) else f"{m.roc_auc:.3f}", help=_metric_help())
     else:
-        st.info("Awaiting CSV upload.")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🎚️ Threshold", f"{threshold:.2f}")
+        c2.metric("🚩 Flagged transactions", int((proba >= threshold).sum()))
+        c3.metric("📄 Total transactions", int(len(results)))
+        c4.metric("🧠 Model", payload.model_name)
+        st.info("Metrics require ground-truth labels. Add an `is_fraud` column (0/1) to your CSV to evaluate.")
+
+    st.divider()
+
+    st.subheader("🚨 Top suspicious transactions")
+    top_n = controls["top_n"]
+    top = results.sort_values("fraud_probability", ascending=False).head(top_n)
+    st.dataframe(top, use_container_width=True, hide_index=True)
+
+    if controls["allow_download"]:
+        st.download_button(
+            "⬇️ Download full results as CSV",
+            data=results.to_csv(index=False).encode("utf-8"),
+            file_name="fraud_predictions.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
+
+    st.divider()
+
+    if y_true is not None:
+        st.subheader("🧪 Evaluation visuals")
+        p1, p2 = st.columns(2)
+        with p1:
+            fig_cm = plot_confusion_matrix(y_true, proba, threshold=threshold)
+            st.pyplot(fig_cm, use_container_width=True)
+        with p2:
+            fig_roc = plot_roc(y_true, proba)
+            st.pyplot(fig_roc, use_container_width=True)
+
+    if controls["show_threshold_impact"]:
+        st.subheader("📈 Threshold tuning impact")
+        impact = threshold_impact(proba, steps=25)
+        st.line_chart(impact.set_index("threshold"))
+        st.caption("As you increase the threshold, fewer transactions are flagged (precision tends to rise, recall tends to fall).")
+
+    st.divider()
+
+    if controls["show_explain"]:
+        _render_explainability(payload, threshold=threshold)
 
 
 if __name__ == "__main__":
